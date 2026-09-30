@@ -180,6 +180,7 @@ class SourceFile(BaseModel):
     stored_as: str = ""
     size: int = 0
     uploaded_at: str = Field(default_factory=now_iso)
+    uploaded_by: str = ""                     # co-authored papers: who added the file (user id)
 
 
 class Passage(BaseModel):
@@ -199,6 +200,8 @@ class ChatMessage(BaseModel):
     options: list[str] = Field(default_factory=list)       # quick replies
     question_id: str | None = None
     data: dict = Field(default_factory=dict)               # structured payload for cards
+    author: str = ""                          # co-authored papers: who wrote a user message (user id)
+    author_name: str = ""
 
 
 class OpenQuestion(BaseModel):
@@ -210,6 +213,24 @@ class OpenQuestion(BaseModel):
     asked_in: str = ""                        # message ID
 
 
+class ProjectMember(BaseModel):
+    """Someone the owner brought into a paper: a co-author (full access) or a reviewer (read and comment)."""
+    uid: str
+    name: str = ""
+    role: Literal["author", "reviewer"] = "author"
+    added_at: str = Field(default_factory=now_iso)
+
+
+class ReviewComment(BaseModel):
+    id: str                                   # "R1"
+    author: str                               # user id
+    author_name: str = ""
+    target: str = "general"                   # a paragraph ID ("P7") or "general"
+    text: str
+    created_at: str = Field(default_factory=now_iso)
+    resolved: bool = False
+
+
 class PaperSettings(BaseModel):
     target_pages: int = 6
     venue: str = ""
@@ -219,6 +240,8 @@ class Project(BaseModel):
     id: str
     name: str
     owner: str = ""                           # hosted version: the signed-in person the paper belongs to
+    members: list[ProjectMember] = Field(default_factory=list)
+    reviews: list[ReviewComment] = Field(default_factory=list)
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
     ledger: Ledger = Field(default_factory=Ledger)

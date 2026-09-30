@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 from . import __version__, auth, bibtex, consistency, export, jobs, planner, provenance, sources, storage, verifier, workspace, writer
 from . import assistant as A
+from . import team
+from .community import api as community_api
 from .models import ClaimType
 from .config import REPO_ROOT, save_env_value, settings
 from .llm import BackendError, all_status, get_backend
@@ -26,14 +28,16 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 app = FastAPI(title="PaperSmithAI", version=__version__)
 
-PUBLIC_PATHS = {"/api/health"}
+PUBLIC_PATHS = {"/api/health", "/api/community/institutions"}
 _PROJECT_PATH = re.compile(r"^/api/projects/([A-Za-z0-9]+)")
 _JOB_PATH = re.compile(r"^/api/jobs/([^/]+)")
+_REVIEWER_WRITES = re.compile(r"^/api/projects/[A-Za-z0-9]+/(reviews(/[A-Za-z0-9]+)?|members/[A-Za-z0-9-]+)$")
 
 
 @app.middleware("http")
 async def signed_in_only(request: Request, call_next):
-    """Hosted version: every API call needs a valid sign-in, and a paper is visible only to its owner."""
+    """Hosted version: every API call needs a valid sign-in, and a paper is visible only to its owner and the
+    people they added (co-authors edit, reviewers read and comment)."""
     path = request.url.path
     if not auth.enabled() or request.method == "OPTIONS" or not path.startswith("/api/") or path in PUBLIC_PATHS:
         return await call_next(request)
@@ -43,21 +47,43 @@ async def signed_in_only(request: Request, call_next):
     if not who:
         return JSONResponse({"detail": "Please sign in again."}, status_code=401)
     m = _PROJECT_PATH.match(path)
-    if m and await run_in_threadpool(storage.owner_of, m.group(1)) != who[0]:
-        return JSONResponse({"detail": "project not found"}, status_code=404)
+    if m:
+        role = await run_in_threadpool(storage.access_of, m.group(1), who[0])
+        if role is None:
+            return JSONResponse({"detail": "project not found"}, status_code=404)
+        if role == "reviewer" and request.method not in ("GET", "HEAD") and not _REVIEWER_WRITES.match(path):
+            return JSONResponse({"detail": "Reviewers can read and comment, but not change the paper."}, status_code=403)
     m = _JOB_PATH.match(path)
     if m:
         try:
-            owner = await run_in_threadpool(storage.owner_of, jobs.get(m.group(1)).project_id)
+            role = await run_in_threadpool(storage.access_of, jobs.get(m.group(1)).project_id, who[0])
         except KeyError:
-            owner = None
-        if owner != who[0]:
+            role = None
+        if role is None:
             return JSONResponse({"detail": "job not found"}, status_code=404)
     reset = auth.current_user.set(who[0])
+    reset_email = auth.current_email.set(who[1])
     try:
         return await call_next(request)
     finally:
         auth.current_user.reset(reset)
+        auth.current_email.reset(reset_email)
+
+
+app.include_router(community_api.router)
+app.include_router(team.router)
+
+try:
+    from neo4j.exceptions import DriverError, Neo4jError
+
+    @app.exception_handler(DriverError)
+    @app.exception_handler(Neo4jError)
+    async def community_unreachable(request: Request, exc: Exception):
+        logging.getLogger("papersmith.community").warning("community graph error: %s", exc)
+        return JSONResponse({"detail": "The community is unavailable for a moment. Please try again shortly."},
+                            status_code=503)
+except ImportError:                     # the laptop version keeps the community in a JSON file
+    pass
 
 
 # added last so it runs first: browsers get CORS headers even on a 401
@@ -167,7 +193,7 @@ def _owner_filter() -> str | None:
 
 @app.get("/api/projects")
 def list_projects():
-    return [{k: v for k, v in s.items() if k != "owner"} for s in storage.list_all(owner=_owner_filter())]
+    return [{k: v for k, v in s.items() if k not in ("owner", "members")} for s in storage.list_all(owner=_owner_filter())]
 
 
 @app.get("/api/me")
@@ -229,7 +255,8 @@ def post_chat(pid: str, body: ChatIn):
         raise HTTPException(400, "empty message")
     if not auth.spend("message", settings.daily_messages):
         raise HTTPException(429, f"You've reached today's limit of {settings.daily_messages} messages. It resets tomorrow.")
-    mid = workspace.post_user_message(pid, body.text)
+    uid = auth.current_user.get()
+    mid = workspace.post_user_message(pid, body.text, author=uid, author_name=community_api.display_name(uid) if uid else "")
     workspace.start_chat(pid, body.backend, body.use_nli)
     return {"message_id": mid}
 
@@ -240,7 +267,7 @@ async def upload_files(pid: str, files: list[UploadFile], backend: str | None = 
     if not auth.spend("upload", settings.daily_uploads, amount=len(files)):
         raise HTTPException(429, f"You've reached today's limit of {settings.daily_uploads} files. It resets tomorrow.")
     payload = [(f.filename or "file", await f.read()) for f in files]
-    accepted, rejected = workspace.add_files(pid, payload)
+    accepted, rejected = workspace.add_files(pid, payload, uploaded_by=auth.current_user.get())
     for fid in accepted:
         workspace.start_ingest(pid, fid, backend, use_nli)
     return {"accepted": accepted, "rejected": rejected}

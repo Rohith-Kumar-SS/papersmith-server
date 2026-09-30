@@ -21,6 +21,7 @@ from .models import Project, now_iso
 
 _lock = threading.RLock()
 _owners: dict[str, str] = {}                # project id -> owner, for the per-request access check
+_members: dict[str, dict[str, str]] = {}    # project id -> {user id: "author" | "reviewer"}
 
 
 def _path(project_id: str) -> Path:
@@ -50,7 +51,13 @@ def summary_of(data: dict) -> dict:
         "pages": round(words / per_page, 1),
         "stage": data.get("stage", ""),
         "owner": data.get("owner", ""),
+        "members": {m["uid"]: m.get("role", "author") for m in data.get("members", []) if m.get("uid")},
     }
+
+
+def _remember(project: Project) -> None:
+    _owners[project.id] = project.owner
+    _members[project.id] = {m.uid: m.role for m in project.members}
 
 
 def save(project: Project) -> Project:
@@ -60,7 +67,7 @@ def save(project: Project) -> Project:
         tmp = _path(project.id).with_suffix(".tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(_path(project.id))
-        _owners[project.id] = project.owner
+        _remember(project)
         if cloud.enabled():
             data = json.loads(text)
             cloud.store().put_project(project.id, project.owner, summary_of(data), text)
@@ -77,7 +84,7 @@ def load(project_id: str) -> Project:
         if not path.exists():
             raise KeyError(project_id)
         project = Project.model_validate_json(path.read_text(encoding="utf-8"))
-        _owners[project.id] = project.owner
+        _remember(project)
         return project
 
 
@@ -98,6 +105,16 @@ def owner_of(project_id: str) -> str | None:
         return load(project_id).owner
     except (KeyError, ValueError):
         return None
+
+
+def access_of(project_id: str, uid: str) -> str | None:
+    """'owner', 'author' (co-author), 'reviewer', or None when this person may not see the project."""
+    owner = owner_of(project_id)
+    if owner is None:
+        return None
+    if owner == uid:
+        return "owner"
+    return _members.get(project_id, {}).get(uid)
 
 
 # ---------------------------------------------------------------- files (uploads, figures)
@@ -161,6 +178,7 @@ def delete(project_id: str) -> None:
         if folder.is_dir():
             shutil.rmtree(folder)
         _owners.pop(project_id, None)
+        _members.pop(project_id, None)
         if cloud.enabled():
             cloud.store().delete_project(project_id, [f"{project_id}/{p}" for p in paths])
 
@@ -181,6 +199,8 @@ def list_all(owner: str | None = None) -> list[dict]:
         if not isinstance(data, dict) or "id" not in data:
             continue
         s = summary_of(data)
-        if owner is None or s["owner"] == owner:
+        if owner is None or s["owner"] == owner or owner in s["members"]:
             items[s["id"]] = s              # this machine's copy is the newest
+    for s in items.values():
+        s["my_role"] = "owner" if owner is None or s.get("owner") == owner else s.get("members", {}).get(owner, "author")
     return sorted(items.values(), key=lambda x: x["updated_at"], reverse=True)

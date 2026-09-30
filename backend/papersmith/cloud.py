@@ -98,7 +98,8 @@ class _Supabase:
 
     # ---------------------------------------------------------------- papers
     def put_project(self, pid: str, owner: str, summary: dict, data_json: str) -> None:
-        row = {"id": pid, "owner": owner or None, "summary": summary, "data": json.loads(data_json),
+        row = {"id": pid, "owner": owner or None, "members": list(summary.get("members", {})),
+               "summary": summary, "data": json.loads(data_json),
                "updated_at": summary.get("updated_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         self._queue(("project", pid), (row,))
 
@@ -107,7 +108,8 @@ class _Supabase:
         return rows[0]["data"] if rows else None
 
     def list_projects(self, owner: str) -> list[dict]:
-        rows = self._rest("GET", "ps_projects", params={"owner": f"eq.{owner}", "select": "summary", "order": "updated_at.desc"}).json()
+        rows = self._rest("GET", "ps_projects", params={"or": f"(owner.eq.{owner},members.cs.{{{owner}}})",
+                                                      "select": "summary", "order": "updated_at.desc"}).json()
         return [r["summary"] for r in rows if r.get("summary")]
 
     def delete_project(self, pid: str, paths: list[str]) -> None:
@@ -169,6 +171,8 @@ create table if not exists public.ps_projects (
   updated_at timestamptz not null default now()
 );
 create index if not exists ps_projects_owner_idx on public.ps_projects (owner, updated_at desc);
+alter table public.ps_projects add column if not exists members uuid[] not null default '{}';
+create index if not exists ps_projects_members_idx on public.ps_projects using gin (members);
 create table if not exists public.ps_passages (
   project_id text primary key,
   data jsonb not null

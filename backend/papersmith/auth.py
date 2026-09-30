@@ -1,5 +1,8 @@
 """Sign-in for the hosted version: Supabase issues the session; the server checks it and scopes every
-request to the person who made it. Off (PAPERSMITH_AUTH=none) on a laptop, where there is one user."""
+request to the person who made it. Off (PAPERSMITH_AUTH=none) on a laptop, where there is one user.
+
+PAPERSMITH_AUTH=dev is for local testing only: a token "dev:<id>:<name>" signs in as that made-up person,
+so several people can be tried on one machine without real accounts."""
 
 from __future__ import annotations
 
@@ -13,19 +16,31 @@ import httpx
 from .config import settings
 
 current_user: contextvars.ContextVar[str] = contextvars.ContextVar("current_user", default="")
+current_email: contextvars.ContextVar[str] = contextvars.ContextVar("current_email", default="")
 
 _cache: dict[str, tuple[str, str, float]] = {}      # token -> (user id, email, expires at)
+_meta: dict[str, dict] = {}                          # user id -> what they entered at sign-up
 _cache_lock = threading.Lock()
 CACHE_SECONDS = 300
 
 
 def enabled() -> bool:
-    return settings.auth == "supabase"
+    return settings.auth in ("supabase", "dev")
+
+
+def metadata(uid: str) -> dict:
+    return dict(_meta.get(uid, {}))
 
 
 def user_for(token: str) -> tuple[str, str] | None:
     """(user id, email) for a Supabase access token, or None when it is missing, expired or forged."""
     if not token:
+        return None
+    if settings.auth == "dev":
+        parts = token.split(":", 2)
+        if len(parts) == 3 and parts[0] == "dev" and parts[1].isalnum():
+            _meta.setdefault(parts[1], {"name": parts[2]})
+            return parts[1], f"{parts[1]}@dev.local"
         return None
     now = time.time()
     with _cache_lock:
@@ -48,6 +63,7 @@ def user_for(token: str) -> tuple[str, str] | None:
         if len(_cache) > 5000:
             _cache.clear()
         _cache[token] = (uid, email, now + CACHE_SECONDS)
+        _meta[uid] = dict(data.get("user_metadata") or {})
     return uid, email
 
 

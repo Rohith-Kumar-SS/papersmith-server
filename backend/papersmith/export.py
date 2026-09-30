@@ -224,6 +224,12 @@ def to_docx(project: Project) -> bytes:
                 cap = d.add_paragraph(f"Fig. {i}. {f.caption}")
                 cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+    from .team import statement as contribution_statement
+
+    contributions = contribution_statement(project)
+    if contributions:
+        d.add_heading("Author contributions", level=1)
+        d.add_paragraph(contributions)
     d.add_heading("AI-use disclosure", level=1)
     d.add_paragraph(provenance.disclosure_statement(project))
     if L.references:

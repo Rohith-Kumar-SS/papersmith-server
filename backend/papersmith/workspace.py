@@ -60,7 +60,7 @@ def processing(p: Project) -> list[SourceFile]:
 
 # ================================================================ uploads
 
-def add_files(pid: str, files: list[tuple[str, bytes]]) -> tuple[list[str], list[str]]:
+def add_files(pid: str, files: list[tuple[str, bytes]], uploaded_by: str = "") -> tuple[list[str], list[str]]:
     """Store uploads and register them. Returns (accepted file IDs, rejection messages)."""
     accepted, rejected = [], []
     with storage.edit(pid) as p:
@@ -78,12 +78,14 @@ def add_files(pid: str, files: list[tuple[str, bytes]]) -> tuple[list[str], list
             stored = f"{fid}{Path(name).suffix.lower()}"
             storage.write_file(pid, f"uploads/{stored}", data)
             role = "data" if kind in ("csv", "xlsx") else "reference" if kind == "bib" else "own"
-            p.sources.append(SourceFile(id=fid, filename=name, kind=kind, role=role, stored_as=stored, size=len(data)))
+            p.sources.append(SourceFile(id=fid, filename=name, kind=kind, role=role, stored_as=stored, size=len(data),
+                                        uploaded_by=uploaded_by))
             accepted.append(fid)
             _log(p, "file_uploaded", file=fid, name=name, bytes=len(data))
         if accepted or rejected:
             names = ", ".join(_file(p, f).filename for f in accepted)
             p.messages.append(A.ChatMessage(id=A.next_message_id(p), role="user", text=f"Uploaded {names}" if names else "Upload",
+                                            author=uploaded_by,
                                             attachments=accepted, data={"handled": True}))
             if rejected:
                 A.say(p, "I couldn't take these files: " + "; ".join(rejected) + ".", kind="error")
@@ -858,11 +860,11 @@ def _chat_guard(pid: str) -> threading.Lock:
         return _chat_guards.setdefault(pid, threading.Lock())
 
 
-def post_user_message(pid: str, text: str) -> str:
+def post_user_message(pid: str, text: str, author: str = "", author_name: str = "") -> str:
     with storage.edit(pid) as p:
         mid = A.next_message_id(p)
         from .models import ChatMessage
-        p.messages.append(ChatMessage(id=mid, role="user", text=text.strip()[:8000]))
+        p.messages.append(ChatMessage(id=mid, role="user", text=text.strip()[:8000], author=author, author_name=author_name))
         if p.stage == "welcome":
             p.stage = "collecting"
     return mid

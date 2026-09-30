@@ -80,7 +80,7 @@ class Settings:
 
     # hosted version: papers mirrored to Supabase, sign-in required, each person sees only their own papers
     storage: str = os.environ.get("PAPERSMITH_STORAGE", "local")          # local | supabase
-    auth: str = os.environ.get("PAPERSMITH_AUTH", "none")                 # none | supabase
+    auth: str = os.environ.get("PAPERSMITH_AUTH", "none")                 # none | supabase | dev (local testing)
     supabase_url: str = os.environ.get("SUPABASE_URL", "")
     supabase_anon_key: str = os.environ.get("SUPABASE_ANON_KEY", "")
     supabase_service_key: str = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -91,9 +91,20 @@ class Settings:
     max_papers: int = int(os.environ.get("MAX_PAPERS", "25"))
     max_upload_mb: int = int(os.environ.get("MAX_UPLOAD_MB", "60"))
 
+    # the research community (graph); empty NEO4J_URI = an in-memory graph saved in data/community.json
+    neo4j_uri: str = os.environ.get("NEO4J_URI", "")
+    neo4j_user: str = os.environ.get("NEO4J_USERNAME", os.environ.get("NEO4J_USER", "neo4j"))
+    neo4j_password: str = os.environ.get("NEO4J_PASSWORD", "")
+    # sending the college-email verification code
+    smtp_host: str = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port: int = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user: str = os.environ.get("SMTP_USER", "")
+    smtp_password: str = os.environ.get("SMTP_PASSWORD", "")
+    smtp_from: str = os.environ.get("SMTP_FROM", "")
+
     @property
     def hosted(self) -> bool:
-        return self.auth == "supabase"
+        return self.auth in ("supabase", "dev")
 
     nli_enabled: bool = _bool("PAPERSMITH_NLI", True)
     nli_model: str = os.environ.get("NLI_MODEL", "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")

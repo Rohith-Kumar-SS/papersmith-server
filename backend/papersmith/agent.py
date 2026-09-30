@@ -138,6 +138,16 @@ def state_text(p: Project) -> str:
         lines.append("Draft: not written yet.")
     if jobs.running(p.id, "write"):
         lines.append("The writer is working on the paper right now.")
+    if p.members:
+        lines.append("Team: " + ", ".join(f"{m.name} ({'co-author' if m.role == 'author' else 'reviewer'})" for m in p.members)
+                     + ". Several researchers may write in this chat; messages show who wrote them.")
+    open_reviews = [r for r in p.reviews if not r.resolved]
+    if open_reviews:
+        lines.append("OPEN REVIEW COMMENTS (from the paper's reviewers; help the researcher address them): " + " | ".join(
+            f"{r.id} on {r.target} by {r.author_name or 'a reviewer'}: {r.text[:220]}" for r in open_reviews[:6]))
+    hint = community_hint(p)
+    if hint:
+        lines.append(hint)
     if p.ledger.claims:
         lines.append(facts_digest(p))
     last = next((m for m in reversed(p.messages) if m.role == "assistant" and m.kind == "text"), None)
@@ -177,9 +187,37 @@ def facts_digest(p: Project, chars: int = FACTS_CHARS) -> str:
     return render(2, 70)[:chars]
 
 
-def _who(m: ChatMessage) -> str:
+def community_hint(p: Project) -> str:
+    """People in the researcher's college whose published profile fits this paper, for the mentor to suggest.
+    Only their public profile (name, role, topics) is used, and only when the researcher is in the community."""
+    if not p.owner:
+        return ""
+    try:
+        from .community import matching
+        from .community.store import store as community_store
+
+        s = community_store()
+        me = s.get_person(p.owner)
+        if not me or not me.get("institution") or not matching.visible(me):
+            return ""
+        ranked = matching.rank(me, s.members(me["institution"]), s.network(p.owner), limit=3)
+    except Exception:  # noqa: BLE001 - the community is a bonus; the mentor works without it
+        log.exception("community hint failed")
+        return ""
+    picks = (ranked["mentors"][:2] + ranked["collaborators"][:2])[:3]
+    if not picks:
+        return ""
+    return ("COMMUNITY (people in the researcher's college who could help; suggest one when it fits, e.g. for a "
+            "reviewer question or a gap, and tell the researcher to find them under Community): " + " | ".join(
+                f"{x['person']['name']} ({x['person']['role_label'] or 'researcher'}; {x['reasons'][0] if x['reasons'] else ''})"
+                for x in picks))
+
+
+def _who(m: ChatMessage, team: bool = False) -> str:
     if m.role == "user":
-        return "event" if m.data.get("event") else "researcher"
+        if m.data.get("event"):
+            return "event"
+        return f"researcher {m.author_name}" if team and m.author_name else "researcher"
     return "you" if m.data.get("mentor") else "note"
 
 
@@ -191,7 +229,7 @@ def history_text(p: Project, reply_to: str, budget: int) -> str:
     for m in reversed(msgs[: idx + 1]):
         limit = 4000 if m.id == reply_to else 600
         text = re.sub(r"\s+", " ", m.text).strip()
-        line = f"{m.id} {_who(m)}: {text[:limit]}{'…' if len(text) > limit else ''}"
+        line = f"{m.id} {_who(m, bool(p.members))}: {text[:limit]}{'…' if len(text) > limit else ''}"
         if lines and (used + len(line) > budget or len(lines) >= 16):
             break
         lines.append(line)
