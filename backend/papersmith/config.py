@@ -101,10 +101,18 @@ class Settings:
     smtp_user: str = os.environ.get("SMTP_USER", "")
     smtp_password: str = os.environ.get("SMTP_PASSWORD", "")
     smtp_from: str = os.environ.get("SMTP_FROM", "")
+    # who runs this PaperSmith: sign-in emails that may approve each college's first admin (comma-separated)
+    owners: str = os.environ.get("PAPERSMITH_OWNERS", "")
+    # research papers of each college: OpenAlex (free; a key raises the daily allowance), Scopus per college
+    openalex_api_key: str = os.environ.get("OPENALEX_API_KEY", "")
+    openalex_mailto: str = os.environ.get("OPENALEX_MAILTO", "")
 
     @property
     def hosted(self) -> bool:
         return self.auth in ("supabase", "dev")
+
+    def is_owner(self, email: str) -> bool:
+        return bool(email) and email.strip().lower() in {e.strip().lower() for e in self.owners.split(",") if e.strip()}
 
     nli_enabled: bool = _bool("PAPERSMITH_NLI", True)
     nli_model: str = os.environ.get("NLI_MODEL", "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")

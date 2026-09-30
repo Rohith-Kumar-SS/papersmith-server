@@ -11,7 +11,7 @@ import logging
 from .. import storage
 from ..llm import BackendError, get_backend
 from ..models import ClaimType
-from .matching import as_items
+from .matching import as_items, tidy
 from .store import store
 
 log = logging.getLogger(__name__)
@@ -79,8 +79,8 @@ def draft(uid: str) -> dict:
         raise ValueError(f"Couldn't draft your profile right now ({exc}). Try again in a minute.") from exc
     return {
         "field": raw.get("field") if raw.get("field") in FIELDS else "Other",
-        "topics": [t["name"] for t in as_items(raw.get("topics", []), 6)],
-        "methods": [m["name"] for m in as_items(raw.get("methods", []), 6)],
+        "topics": [t["name"] for t in as_items(tidy(raw.get("topics", [])), 6)],
+        "methods": [m["name"] for m in as_items(tidy(raw.get("methods", [])), 6)],
         "needs": [" ".join(str(n).split())[:120] for n in raw.get("needs", []) if str(n).strip()][:3],
         "bio": " ".join(str(raw.get("bio", "")).split())[:240],
     }

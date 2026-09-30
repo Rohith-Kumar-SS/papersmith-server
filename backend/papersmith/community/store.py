@@ -1,15 +1,19 @@
 """Where the community lives. Neo4j when NEO4J_URI is set (the hosted version); otherwise an in-memory
-graph kept in a JSON file (tests and the laptop). Both expose the same small interface, and matching,
-mentors and the explorer only use that interface.
+graph kept in a JSON file (tests and the laptop). Both expose the same small interface, and everything else
+(matching, openings, questions, college dashboards) only uses that interface.
 
 Graph model (Neo4j):
-  (:Person {uid, name, role, department, verified, visibility, published, field, bio, needs, email_domain})
-  (:Person)-[:MEMBER_OF]->(:Institution {key, name, domains})
+  (:Person {uid, name, role, department, verified, role_verified, visibility, published, field, bio, needs_json,
+            inferred_json, scholar_json, email_domain, updated_at, joined_at})
+  (:Person)-[:MEMBER_OF]->(:Institution {key, name, domains, meta_json})
   (:Person)-[:WORKS_ON {weight}]->(:Topic {key, name})
   (:Person)-[:USES {weight}]->(:Method {key, name})
   (:Person)-[:REQUESTED {message, at}]->(:Person)      a pending connection request
   (:Person)-[:CONNECTED {since}]-(:Person)             an accepted connection
-  (:Person)-[:COAUTHOR {pid}]-(:Person)                 people who wrote a paper together
+  (:Person)-[:COAUTHOR]-(:Person)                      people who wrote a paper together
+  (:Doc {key, kind, id, institution, owner, data, updated_at})   an opening, application, question, project
+                                                       record, notification... (data is the JSON document)
+  (:Person)-[:POSTED]->(:Doc)-[:AT]->(:Institution), (:Doc)-[:ABOUT]->(:Topic|Method)
 """
 
 from __future__ import annotations
@@ -22,8 +26,13 @@ from pathlib import Path
 from ..config import settings
 from ..models import now_iso
 
-PERSON_FIELDS = ("uid", "name", "role", "department", "verified", "visibility", "published", "field", "bio",
-                 "email_domain", "institution", "needs", "topics", "methods", "updated_at", "joined_at")
+PERSON_FIELDS = ("uid", "name", "role", "department", "verified", "role_verified", "visibility", "published", "field",
+                 "bio", "email_domain", "institution", "needs", "topics", "methods", "inferred", "scholar",
+                 "updated_at", "joined_at")
+_SIMPLE = ("name", "role", "department", "verified", "role_verified", "visibility", "published", "field", "bio",
+           "email_domain")
+_JSON = {"needs": "needs_json", "inferred": "inferred_json", "scholar": "scholar_json"}
+DOC_KINDS = {"opening", "application", "question", "record", "notification", "admin_request", "pubcache", "paper_topics"}
 
 
 def key_of(text: str) -> str:
@@ -40,9 +49,20 @@ def key_of(text: str) -> str:
 
 
 def _blank_person(uid: str) -> dict:
-    return {"uid": uid, "name": "", "role": "", "department": "", "verified": False, "visibility": "community",
-            "published": False, "field": "", "bio": "", "email_domain": "", "institution": "", "needs": [],
-            "topics": [], "methods": [], "updated_at": now_iso(), "joined_at": now_iso()}
+    return {"uid": uid, "name": "", "role": "", "department": "", "verified": False, "role_verified": False,
+            "visibility": "community", "published": False, "field": "", "bio": "", "email_domain": "",
+            "institution": "", "needs": [], "topics": [], "methods": [], "inferred": {}, "scholar": {},
+            "updated_at": now_iso(), "joined_at": now_iso()}
+
+
+def _copy(x):
+    return json.loads(json.dumps(x))
+
+
+def _doc_key(kind: str, doc_id: str) -> str:
+    if kind not in DOC_KINDS:
+        raise ValueError(f"unknown document kind {kind}")
+    return f"{kind}:{doc_id}"
 
 
 # ================================================================ in-memory graph (tests, laptop)
@@ -56,6 +76,7 @@ class MemoryStore:
         self.requests: dict[tuple[str, str], dict] = {}       # (from, to) -> {message, at}
         self.connections: dict[frozenset, str] = {}          # {a, b} -> since
         self.coauthors: set[frozenset] = set()
+        self.docs: dict[str, dict] = {}                      # "kind:id" -> {kind, id, institution, owner, data, updated_at}
         if path and path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
             self.people = data.get("people", {})
@@ -63,6 +84,10 @@ class MemoryStore:
             self.requests = {(r["from"], r["to"]): {"message": r["message"], "at": r["at"]} for r in data.get("requests", [])}
             self.connections = {frozenset(c["pair"]): c["since"] for c in data.get("connections", [])}
             self.coauthors = {frozenset(c) for c in data.get("coauthors", [])}
+            self.docs = data.get("docs", {})
+            for p in self.people.values():
+                for k, v in _blank_person(p["uid"]).items():
+                    p.setdefault(k, v)
 
     def _save(self) -> None:
         if not self.path:
@@ -70,57 +95,86 @@ class MemoryStore:
         data = {"people": self.people, "institutions": self.institutions,
                 "requests": [{"from": a, "to": b, **r} for (a, b), r in self.requests.items()],
                 "connections": [{"pair": sorted(k), "since": v} for k, v in self.connections.items()],
-                "coauthors": [sorted(c) for c in self.coauthors]}
+                "coauthors": [sorted(c) for c in self.coauthors], "docs": self.docs}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(self.path)
 
     # ---------------------------------------------------------------- colleges
-    def institution(self, key: str) -> dict | None:
-        return self.institutions.get(key)
+    @staticmethod
+    def _inst_view(inst: dict) -> dict:
+        return {**_copy(inst.get("meta", {})), "key": inst["key"], "name": inst["name"], "domains": list(inst["domains"])}
 
-    def upsert_institution(self, name: str, domain: str = "") -> dict:
+    def institution(self, key: str) -> dict | None:
+        inst = self.institutions.get(key)
+        return self._inst_view(inst) if inst else None
+
+    def upsert_institution(self, name: str, domain: str = "", key: str | None = None) -> dict:
         with self._lock:
-            key = key_of(name)
-            inst = self.institutions.setdefault(key, {"key": key, "name": name.strip(), "domains": []})
+            key = key or key_of(name)
+            inst = self.institutions.setdefault(key, {"key": key, "name": name.strip(), "domains": [], "meta": {}})
             if domain and domain not in inst["domains"]:
                 inst["domains"].append(domain)
             self._save()
-            return dict(inst)
+            return self._inst_view(inst)
+
+    def update_institution(self, key: str, **meta) -> dict | None:
+        with self._lock:
+            inst = self.institutions.get(key)
+            if not inst:
+                return None
+            if "name" in meta:
+                inst["name"] = meta.pop("name")
+            inst.setdefault("meta", {}).update(_copy(meta))
+            self._save()
+            return self._inst_view(inst)
+
+    def delete_institution(self, key: str) -> None:
+        with self._lock:
+            self.institutions.pop(key, None)
+            self._save()
 
     def institution_for_domain(self, domain: str) -> dict | None:
         for inst in self.institutions.values():
             if any(domain == d or domain.endswith("." + d) for d in inst["domains"]):
-                return dict(inst)
+                return self._inst_view(inst)
         return None
+
+    def member_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for p in self.people.values():
+            if p.get("institution"):
+                counts[p["institution"]] = counts.get(p["institution"], 0) + 1
+        return counts
+
+    def all_institutions(self) -> list[dict]:
+        counts = self.member_counts()
+        return [dict(self._inst_view(i), members=counts.get(k, 0)) for k, i in self.institutions.items()]
 
     def search_institutions(self, q: str, limit: int = 10) -> list[dict]:
         qk = key_of(q)
-        counts: dict[str, int] = {}
-        for p in self.people.values():
-            counts[p.get("institution", "")] = counts.get(p.get("institution", ""), 0) + 1
-        found = [dict(i, members=counts.get(i["key"], 0)) for i in self.institutions.values()
-                 if not qk or qk in i["key"] or any(qk in d for d in i["domains"])]
+        found = [i for i in self.all_institutions()
+                 if not qk or qk in key_of(i["name"]) or qk in i["key"] or any(qk in d for d in i["domains"])]
         return sorted(found, key=lambda i: (-i["members"], i["name"]))[:limit]
 
     # ---------------------------------------------------------------- people
     def get_person(self, uid: str) -> dict | None:
         p = self.people.get(uid)
-        return json.loads(json.dumps(p)) if p else None
+        return _copy(p) if p else None
 
     def upsert_person(self, uid: str, **fields) -> dict:
         with self._lock:
             p = self.people.setdefault(uid, _blank_person(uid))
             for k, v in fields.items():
                 if k in PERSON_FIELDS and k != "uid":
-                    p[k] = v
+                    p[k] = _copy(v)
             p["updated_at"] = now_iso()
             self._save()
-            return json.loads(json.dumps(p))
+            return _copy(p)
 
     def members(self, institution: str) -> list[dict]:
-        return [json.loads(json.dumps(p)) for p in self.people.values() if p.get("institution") == institution]
+        return [_copy(p) for p in self.people.values() if p.get("institution") == institution]
 
     # ---------------------------------------------------------------- connections
     def request(self, a: str, b: str, message: str) -> None:
@@ -141,6 +195,15 @@ class MemoryStore:
             self.connections[frozenset((a, b))] = now_iso()
             self._save()
             return True
+
+    def connect_now(self, a: str, b: str) -> None:
+        """Connect two people directly (an accepted application)."""
+        with self._lock:
+            if a != b:
+                self.requests.pop((a, b), None)
+                self.requests.pop((b, a), None)
+                self.connections.setdefault(frozenset((a, b)), now_iso())
+                self._save()
 
     def decline(self, a: str, b: str) -> None:
         with self._lock:
@@ -174,6 +237,34 @@ class MemoryStore:
         members = {uid for uid, p in self.people.items() if p.get("institution") == institution}
         return [tuple(sorted(k)) for k in self.connections if k <= members]
 
+    def coauthors_among(self, institution: str) -> list[tuple[str, str]]:
+        members = {uid for uid, p in self.people.items() if p.get("institution") == institution}
+        return [tuple(sorted(k)) for k in self.coauthors if k <= members]
+
+    # ---------------------------------------------------------------- documents
+    def put_doc(self, kind: str, doc: dict) -> dict:
+        with self._lock:
+            key = _doc_key(kind, doc["id"])
+            self.docs[key] = {"kind": kind, "id": doc["id"], "institution": doc.get("institution", ""),
+                              "owner": doc.get("owner", ""), "data": _copy(doc), "updated_at": now_iso()}
+            self._save()
+            return _copy(doc)
+
+    def get_doc(self, kind: str, doc_id: str) -> dict | None:
+        d = self.docs.get(_doc_key(kind, doc_id))
+        return _copy(d["data"]) if d else None
+
+    def list_docs(self, kind: str, institution: str | None = None, owner: str | None = None, limit: int = 500) -> list[dict]:
+        rows = [d for d in self.docs.values() if d["kind"] == kind
+                and (institution is None or d["institution"] == institution) and (owner is None or d["owner"] == owner)]
+        rows.sort(key=lambda d: d["updated_at"], reverse=True)
+        return [_copy(d["data"]) for d in rows[:limit]]
+
+    def delete_doc(self, kind: str, doc_id: str) -> None:
+        with self._lock:
+            self.docs.pop(_doc_key(kind, doc_id), None)
+            self._save()
+
 
 # ================================================================ Neo4j (hosted)
 
@@ -193,41 +284,74 @@ class Neo4jStore:
         return [r.data() for r in records]
 
     def _setup(self) -> None:
-        self._ready = True
         for q in ("CREATE CONSTRAINT person_uid IF NOT EXISTS FOR (p:Person) REQUIRE p.uid IS UNIQUE",
                   "CREATE CONSTRAINT institution_key IF NOT EXISTS FOR (i:Institution) REQUIRE i.key IS UNIQUE",
                   "CREATE CONSTRAINT topic_key IF NOT EXISTS FOR (t:Topic) REQUIRE t.key IS UNIQUE",
-                  "CREATE CONSTRAINT method_key IF NOT EXISTS FOR (m:Method) REQUIRE m.key IS UNIQUE"):
+                  "CREATE CONSTRAINT method_key IF NOT EXISTS FOR (m:Method) REQUIRE m.key IS UNIQUE",
+                  "CREATE CONSTRAINT doc_key IF NOT EXISTS FOR (d:Doc) REQUIRE d.key IS UNIQUE",
+                  "CREATE INDEX doc_kind_institution IF NOT EXISTS FOR (d:Doc) ON (d.kind, d.institution)",
+                  "CREATE INDEX doc_kind_owner IF NOT EXISTS FOR (d:Doc) ON (d.kind, d.owner)"):
             self.driver.execute_query(q, database_="neo4j")
+        self._ready = True
 
     # ---------------------------------------------------------------- colleges
-    def institution(self, key: str) -> dict | None:
-        rows = self._run("MATCH (i:Institution {key: $key}) RETURN i {.key, .name, .domains} AS i", key=key)
-        return rows[0]["i"] if rows else None
+    _INST = "i {.key, .name, .domains, meta: coalesce(i.meta_json, '{}')} AS i"
 
-    def upsert_institution(self, name: str, domain: str = "") -> dict:
+    @staticmethod
+    def _inst(row: dict) -> dict:
+        i = dict(row["i"])
+        meta = json.loads(i.pop("meta") or "{}")
+        return {**meta, "key": i["key"], "name": i["name"], "domains": list(i.get("domains") or [])}
+
+    def institution(self, key: str) -> dict | None:
+        rows = self._run(f"MATCH (i:Institution {{key: $key}}) RETURN {self._INST}", key=key)
+        return self._inst(rows[0]) if rows else None
+
+    def upsert_institution(self, name: str, domain: str = "", key: str | None = None) -> dict:
         rows = self._run(
-            "MERGE (i:Institution {key: $key}) ON CREATE SET i.name = $name, i.domains = [] "
+            "MERGE (i:Institution {key: $key}) ON CREATE SET i.name = $name, i.domains = [], i.meta_json = '{}' "
             "WITH i SET i.domains = CASE WHEN $domain <> '' AND NOT $domain IN i.domains THEN i.domains + $domain ELSE i.domains END "
-            "RETURN i {.key, .name, .domains} AS i", key=key_of(name), name=name.strip(), domain=domain)
-        return rows[0]["i"]
+            f"RETURN {self._INST}", key=key or key_of(name), name=name.strip(), domain=domain)
+        return self._inst(rows[0])
+
+    def update_institution(self, key: str, **meta) -> dict | None:
+        current = self.institution(key)
+        if current is None:
+            return None
+        name = meta.pop("name", current["name"])
+        merged = {k: v for k, v in current.items() if k not in ("key", "name", "domains")}
+        merged.update(meta)
+        rows = self._run(f"MATCH (i:Institution {{key: $key}}) SET i.name = $name, i.meta_json = $meta RETURN {self._INST}",
+                         key=key, name=name, meta=json.dumps(merged))
+        return self._inst(rows[0]) if rows else None
+
+    def delete_institution(self, key: str) -> None:
+        self._run("MATCH (i:Institution {key: $key}) DETACH DELETE i", key=key)
 
     def institution_for_domain(self, domain: str) -> dict | None:
         rows = self._run("MATCH (i:Institution) WHERE any(d IN i.domains WHERE $domain = d OR $domain ENDS WITH '.' + d) "
-                         "RETURN i {.key, .name, .domains} AS i LIMIT 1", domain=domain)
-        return rows[0]["i"] if rows else None
+                         f"RETURN {self._INST} LIMIT 1", domain=domain)
+        return self._inst(rows[0]) if rows else None
+
+    def member_counts(self) -> dict[str, int]:
+        rows = self._run("MATCH (p:Person)-[:MEMBER_OF]->(i:Institution) RETURN i.key AS key, count(p) AS n")
+        return {r["key"]: r["n"] for r in rows}
+
+    def all_institutions(self) -> list[dict]:
+        rows = self._run("MATCH (i:Institution) OPTIONAL MATCH (p:Person)-[:MEMBER_OF]->(i) "
+                         f"WITH i, count(p) AS members RETURN {self._INST}, members")
+        return [dict(self._inst(r), members=r["members"]) for r in rows]
 
     def search_institutions(self, q: str, limit: int = 10) -> list[dict]:
-        rows = self._run(
-            "MATCH (i:Institution) WHERE $q = '' OR i.key CONTAINS $q OR any(d IN i.domains WHERE d CONTAINS $q) "
-            "OPTIONAL MATCH (p:Person)-[:MEMBER_OF]->(i) "
-            "WITH i, count(p) AS members RETURN i {.key, .name, .domains, members: members} AS i "
-            "ORDER BY members DESC, i.name LIMIT $limit", q=key_of(q), limit=limit)
-        return [r["i"] for r in rows]
+        qk = key_of(q)
+        found = [i for i in self.all_institutions()
+                 if not qk or qk in key_of(i["name"]) or qk in i["key"] or any(qk in d for d in i["domains"])]
+        return sorted(found, key=lambda i: (-i["members"], i["name"]))[:limit]
 
     # ---------------------------------------------------------------- people
-    _PERSON = ("p {.uid, .name, .role, .department, .verified, .visibility, .published, .field, .bio, .email_domain, "
-               ".updated_at, .joined_at, needs: coalesce(p.needs_json, '[]'), institution: i.key, "
+    _PERSON = ("p {.uid, .name, .role, .department, .verified, .role_verified, .visibility, .published, .field, .bio, "
+               ".email_domain, .updated_at, .joined_at, needs: coalesce(p.needs_json, '[]'), "
+               "inferred: coalesce(p.inferred_json, '{}'), scholar: coalesce(p.scholar_json, '{}'), institution: i.key, "
                "topics: [(p)-[w:WORKS_ON]->(t:Topic) | {key: t.key, name: t.name, weight: w.weight}], "
                "methods: [(p)-[u:USES]->(m:Method) | {key: m.key, name: m.name, weight: u.weight}]} AS p")
 
@@ -235,9 +359,14 @@ class Neo4jStore:
     def _person(row: dict) -> dict:
         p = dict(row["p"])
         p["needs"] = json.loads(p.get("needs") or "[]")
+        p["inferred"] = json.loads(p.get("inferred") or "{}")
+        p["scholar"] = json.loads(p.get("scholar") or "{}")
         p["institution"] = p.get("institution") or ""
-        for k in ("verified", "published"):
+        for k in ("verified", "published", "role_verified"):
             p[k] = bool(p.get(k))
+        for k in ("name", "role", "department", "field", "bio", "email_domain"):
+            p[k] = p.get(k) or ""
+        p["visibility"] = p.get("visibility") or "community"
         return p
 
     def get_person(self, uid: str) -> dict | None:
@@ -245,16 +374,14 @@ class Neo4jStore:
         return self._person(rows[0]) if rows else None
 
     def upsert_person(self, uid: str, **fields) -> dict:
-        simple = {k: v for k, v in fields.items() if k in ("name", "role", "department", "verified", "visibility",
-                                                             "published", "field", "bio", "email_domain")}
+        simple = {k: v for k, v in fields.items() if k in _SIMPLE}
+        simple.update({prop: json.dumps(fields[k]) for k, prop in _JSON.items() if k in fields})
         self._run("MERGE (p:Person {uid: $uid}) ON CREATE SET p.joined_at = $now, p.verified = false, "
                   "p.published = false, p.visibility = 'community' SET p += $simple, p.updated_at = $now",
                   uid=uid, simple=simple, now=now_iso())
-        if "needs" in fields:
-            self._run("MATCH (p:Person {uid: $uid}) SET p.needs_json = $needs", uid=uid, needs=json.dumps(fields["needs"]))
         if "institution" in fields:
             self._run("MATCH (p:Person {uid: $uid}) OPTIONAL MATCH (p)-[r:MEMBER_OF]->() DELETE r "
-                      "WITH p MATCH (i:Institution {key: $key}) MERGE (p)-[:MEMBER_OF]->(i)", uid=uid, key=fields["institution"])
+                      "WITH DISTINCT p MATCH (i:Institution {key: $key}) MERGE (p)-[:MEMBER_OF]->(i)", uid=uid, key=fields["institution"])
         for field, label, rel in (("topics", "Topic", "WORKS_ON"), ("methods", "Method", "USES")):
             if field in fields:
                 items = [{"key": x["key"], "name": x["name"], "weight": float(x.get("weight", 1.0))} for x in fields[field]]
@@ -286,6 +413,14 @@ class Neo4jStore:
                          a=a, b=b, now=now_iso())
         return bool(rows and rows[0]["n"])
 
+    def connect_now(self, a: str, b: str) -> None:
+        if a == b:
+            return
+        self._run("MATCH (a:Person {uid: $a}), (b:Person {uid: $b}) "
+                  "OPTIONAL MATCH (a)-[r:REQUESTED]-(b) DELETE r "
+                  "WITH DISTINCT a, b WHERE NOT EXISTS { (a)-[:CONNECTED]-(b) } "
+                  "MERGE (a)-[c:CONNECTED]->(b) ON CREATE SET c.since = $now", a=a, b=b, now=now_iso())
+
     def decline(self, a: str, b: str) -> None:
         self._run("MATCH (:Person {uid: $a})-[r:REQUESTED]->(:Person {uid: $b}) DELETE r", a=a, b=b)
 
@@ -313,6 +448,45 @@ class Neo4jStore:
         rows = self._run("MATCH (a:Person)-[:MEMBER_OF]->(i:Institution {key: $key})<-[:MEMBER_OF]-(b:Person), "
                          "(a)-[:CONNECTED]-(b) WHERE a.uid < b.uid RETURN DISTINCT a.uid AS a, b.uid AS b", key=institution)
         return [(r["a"], r["b"]) for r in rows]
+
+    def coauthors_among(self, institution: str) -> list[tuple[str, str]]:
+        rows = self._run("MATCH (a:Person)-[:MEMBER_OF]->(i:Institution {key: $key})<-[:MEMBER_OF]-(b:Person), "
+                         "(a)-[:COAUTHOR]-(b) WHERE a.uid < b.uid RETURN DISTINCT a.uid AS a, b.uid AS b", key=institution)
+        return [(r["a"], r["b"]) for r in rows]
+
+    # ---------------------------------------------------------------- documents
+    def put_doc(self, kind: str, doc: dict) -> dict:
+        key = _doc_key(kind, doc["id"])
+        linked = kind not in ("notification", "pubcache")      # the graph only needs the research documents
+        items = lambda field: [{"key": x["key"], "name": x.get("name", x["key"])} for x in doc.get(field) or []  # noqa: E731
+                               if isinstance(x, dict) and x.get("key")]
+        self._run(
+            "MERGE (d:Doc {key: $key}) SET d.kind = $kind, d.id = $id, d.institution = $inst, d.owner = $owner, "
+            "d.data = $data, d.updated_at = $now "
+            "WITH d CALL (d) { OPTIONAL MATCH (d)-[r:AT|ABOUT]->() DELETE r } "
+            "CALL (d) { MATCH (i:Institution {key: $inst}) WHERE $linked MERGE (d)-[:AT]->(i) } "
+            "CALL (d) { MATCH (p:Person {uid: $owner}) WHERE $linked MERGE (p)-[:POSTED]->(d) } "
+            "CALL (d) { UNWIND $topics AS x MERGE (t:Topic {key: x.key}) ON CREATE SET t.name = x.name MERGE (d)-[:ABOUT]->(t) } "
+            "CALL (d) { UNWIND $methods AS x MERGE (m:Method {key: x.key}) ON CREATE SET m.name = x.name MERGE (d)-[:ABOUT]->(m) } "
+            "RETURN d.key AS key",
+            key=key, kind=kind, id=doc["id"], inst=doc.get("institution", ""), owner=doc.get("owner", ""),
+            data=json.dumps(doc), now=now_iso(), linked=linked,
+            topics=items("topics") if linked else [], methods=items("methods") if linked else [])
+        return _copy(doc)
+
+    def get_doc(self, kind: str, doc_id: str) -> dict | None:
+        rows = self._run("MATCH (d:Doc {key: $key}) RETURN d.data AS data", key=_doc_key(kind, doc_id))
+        return json.loads(rows[0]["data"]) if rows else None
+
+    def list_docs(self, kind: str, institution: str | None = None, owner: str | None = None, limit: int = 500) -> list[dict]:
+        _doc_key(kind, "x")
+        rows = self._run("MATCH (d:Doc {kind: $kind}) WHERE ($inst IS NULL OR d.institution = $inst) "
+                         "AND ($owner IS NULL OR d.owner = $owner) RETURN d.data AS data ORDER BY d.updated_at DESC LIMIT $limit",
+                         kind=kind, inst=institution, owner=owner, limit=limit)
+        return [json.loads(r["data"]) for r in rows]
+
+    def delete_doc(self, kind: str, doc_id: str) -> None:
+        self._run("MATCH (d:Doc {key: $key}) DETACH DELETE d", key=_doc_key(kind, doc_id))
 
 
 # ================================================================ the one in use

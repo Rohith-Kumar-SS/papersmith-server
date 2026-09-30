@@ -17,6 +17,11 @@ from . import __version__, auth, bibtex, consistency, export, jobs, planner, pro
 from . import assistant as A
 from . import team
 from .community import api as community_api
+from .community import college as community_college
+from .community import interests as community_interests
+from .community import openings as community_openings
+from .community import questions as community_questions
+from .community import related as community_related
 from .models import ClaimType
 from .config import REPO_ROOT, save_env_value, settings
 from .llm import BackendError, all_status, get_backend
@@ -29,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 app = FastAPI(title="PaperSmithAI", version=__version__)
 
 PUBLIC_PATHS = {"/api/health", "/api/community/institutions"}
+_PUBLIC_DEPARTMENTS = re.compile(r"^/api/community/institutions/[A-Za-z0-9-]+/departments$")      # the sign-up form
 _PROJECT_PATH = re.compile(r"^/api/projects/([A-Za-z0-9]+)")
 _JOB_PATH = re.compile(r"^/api/jobs/([^/]+)")
 _REVIEWER_WRITES = re.compile(r"^/api/projects/[A-Za-z0-9]+/(reviews(/[A-Za-z0-9]+)?|members/[A-Za-z0-9-]+)$")
@@ -39,7 +45,8 @@ async def signed_in_only(request: Request, call_next):
     """Hosted version: every API call needs a valid sign-in, and a paper is visible only to its owner and the
     people they added (co-authors edit, reviewers read and comment)."""
     path = request.url.path
-    if not auth.enabled() or request.method == "OPTIONS" or not path.startswith("/api/") or path in PUBLIC_PATHS:
+    if (not auth.enabled() or request.method == "OPTIONS" or not path.startswith("/api/") or path in PUBLIC_PATHS
+            or _PUBLIC_DEPARTMENTS.match(path)):
         return await call_next(request)
     header = request.headers.get("authorization", "")
     token = header[7:].strip() if header.lower().startswith("bearer ") else ""
@@ -71,6 +78,10 @@ async def signed_in_only(request: Request, call_next):
 
 
 app.include_router(community_api.router)
+app.include_router(community_openings.router)
+app.include_router(community_questions.router)
+app.include_router(community_college.router)
+app.include_router(community_related.router)
 app.include_router(team.router)
 
 try:
@@ -258,6 +269,7 @@ def post_chat(pid: str, body: ChatIn):
     uid = auth.current_user.get()
     mid = workspace.post_user_message(pid, body.text, author=uid, author_name=community_api.display_name(uid) if uid else "")
     workspace.start_chat(pid, body.backend, body.use_nli)
+    community_interests.touch(pid)          # what the paper is about may have changed
     return {"message_id": mid}
 
 
@@ -270,6 +282,8 @@ async def upload_files(pid: str, files: list[UploadFile], backend: str | None = 
     accepted, rejected = workspace.add_files(pid, payload, uploaded_by=auth.current_user.get())
     for fid in accepted:
         workspace.start_ingest(pid, fid, backend, use_nli)
+    if accepted:
+        community_interests.touch(pid, delay=240)      # after the files have been read
     return {"accepted": accepted, "rejected": rejected}
 
 

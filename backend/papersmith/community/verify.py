@@ -1,9 +1,10 @@
 """Proving you belong to a college: a one-time code sent to your college email.
 
 Sign-in email is not proof (anyone can sign up with any address), so membership is verified separately.
-A verified domain belongs to the college: the first verified member of a college brings its domain, later
-members must use one of its domains (or a subdomain, e.g. student.nitt.edu), and a domain another college
-already owns moves the person to that college, which is how duplicate college names get merged.
+A verified domain belongs to the college: a listed college already knows its website's domain (from the
+directory), an unlisted one learns it from its first verified member; later members must use one of its
+domains (or a subdomain, e.g. student.nitt.edu), and a domain another college owns moves the person to that
+college, which is how duplicate college names get merged.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import time
 from email.message import EmailMessage
 
 from ..config import settings
+from . import core, directory
 from .store import store
 
 FREE_MAIL = {"gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.in", "ymail.com", "outlook.com", "hotmail.com",
@@ -56,6 +58,12 @@ def _college_check(uid: str, domain: str) -> tuple[dict | None, dict | None]:
     me = s.get_person(uid) or {}
     mine = s.institution(me.get("institution", "")) if me.get("institution") else None
     owner = s.institution_for_domain(domain)
+    if owner is None:
+        listed = directory.for_domain(domain)
+        if listed:
+            owner = core.college_from_directory(listed)
+    if mine and not mine["domains"] and mine.get("website"):
+        mine = {**mine, "domains": [mine["website"]]}
     if owner is None and mine and mine["domains"] and not ACADEMIC.search(domain):
         raise ValueError(f"That email isn't from {mine['name']} ({', '.join(mine['domains'])}).")
     if owner is None and mine is None:
@@ -102,7 +110,9 @@ def confirm(uid: str, code: str) -> dict:
     if owner:
         college = owner                     # the domain already belongs to a college: join that one
     else:
-        college = s.upsert_institution(mine["name"], domain=domain)
+        college = s.upsert_institution(mine["name"], domain=domain, key=mine["key"])
+    if domain not in college.get("domains", []):
+        s.upsert_institution(college["name"], domain=domain, key=college["key"])
     return s.upsert_person(uid, institution=college["key"], verified=True, email_domain=domain)
 
 

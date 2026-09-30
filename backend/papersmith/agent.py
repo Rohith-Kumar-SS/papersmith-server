@@ -193,24 +193,33 @@ def community_hint(p: Project) -> str:
     if not p.owner:
         return ""
     try:
-        from .community import matching
+        from .community import interests, matching, related
         from .community.store import store as community_store
 
         s = community_store()
         me = s.get_person(p.owner)
-        if not me or not me.get("institution") or not matching.visible(me):
+        if not me or not me.get("institution"):
             return ""
-        ranked = matching.rank(me, s.members(me["institution"]), s.network(p.owner), limit=3)
+        lines = []
+        doc = s.get_doc("paper_topics", p.id)
+        if doc:                              # people at the college on this paper's own topics
+            found = related.find(doc, limit=3)
+            lines += [f"{x['person']['name']} ({x['person']['role_label'] or 'researcher'}; works on {', '.join(x['shared'])})"
+                      for x in found["people"]]
+            lines += [f"open project “{o['title']}” by {o['owner_name']} (on {', '.join(o['shared'])})" for o in found["openings"][:1]]
+            lines += [f"ongoing college project “{r['title']}” led by {r['lead'] or 'a colleague'}" for r in found["projects"][:1]]
+        if not lines:
+            ranked = matching.rank(me, s.members(me["institution"]), s.network(p.owner), limit=3,
+                                   private=interests.private_interests(me))
+            lines = [f"{x['person']['name']} ({x['person']['role_label'] or 'researcher'}; {x['reasons'][0] if x['reasons'] else ''})"
+                     for x in (ranked["mentors"][:2] + ranked["collaborators"][:2])[:3]]
     except Exception:  # noqa: BLE001 - the community is a bonus; the mentor works without it
         log.exception("community hint failed")
         return ""
-    picks = (ranked["mentors"][:2] + ranked["collaborators"][:2])[:3]
-    if not picks:
+    if not lines:
         return ""
-    return ("COMMUNITY (people in the researcher's college who could help; suggest one when it fits, e.g. for a "
-            "reviewer question or a gap, and tell the researcher to find them under Community): " + " | ".join(
-                f"{x['person']['name']} ({x['person']['role_label'] or 'researcher'}; {x['reasons'][0] if x['reasons'] else ''})"
-                for x in picks))
+    return ("COMMUNITY (people and projects in the researcher's college on the same work; suggest one when it fits, e.g. "
+            "for a reviewer, a gap or a collaborator, and tell the researcher to find them under Community): " + " | ".join(lines[:4]))
 
 
 def _who(m: ChatMessage, team: bool = False) -> str:
