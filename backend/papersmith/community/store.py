@@ -11,8 +11,9 @@ Graph model (Neo4j):
   (:Person)-[:REQUESTED {message, at}]->(:Person)      a pending connection request
   (:Person)-[:CONNECTED {since}]-(:Person)             an accepted connection
   (:Person)-[:COAUTHOR]-(:Person)                      people who wrote a paper together
-  (:Doc {key, kind, id, institution, owner, data, updated_at})   an opening, application, question, project
-                                                       record, notification... (data is the JSON document)
+  (:Doc {key, kind, id, institution, owner, members, data, updated_at})   an opening, application, question,
+                                                       project record, notification, conversation... (data is
+                                                       the JSON document; members: who a conversation is between)
   (:Person)-[:POSTED]->(:Doc)-[:AT]->(:Institution), (:Doc)-[:ABOUT]->(:Topic|Method)
 """
 
@@ -32,7 +33,9 @@ PERSON_FIELDS = ("uid", "name", "role", "department", "verified", "role_verified
 _SIMPLE = ("name", "role", "department", "verified", "role_verified", "visibility", "published", "field", "bio",
            "email_domain")
 _JSON = {"needs": "needs_json", "inferred": "inferred_json", "scholar": "scholar_json"}
-DOC_KINDS = {"opening", "application", "question", "record", "notification", "admin_request", "pubcache", "paper_topics"}
+DOC_KINDS = {"opening", "application", "question", "record", "notification", "admin_request", "pubcache", "paper_topics",
+             "thread"}
+_UNLINKED = {"notification", "pubcache", "thread"}          # private or bookkeeping: not part of the research graph
 
 
 def key_of(text: str) -> str:
@@ -254,9 +257,11 @@ class MemoryStore:
         d = self.docs.get(_doc_key(kind, doc_id))
         return _copy(d["data"]) if d else None
 
-    def list_docs(self, kind: str, institution: str | None = None, owner: str | None = None, limit: int = 500) -> list[dict]:
+    def list_docs(self, kind: str, institution: str | None = None, owner: str | None = None, limit: int = 500,
+                  member: str | None = None) -> list[dict]:
         rows = [d for d in self.docs.values() if d["kind"] == kind
-                and (institution is None or d["institution"] == institution) and (owner is None or d["owner"] == owner)]
+                and (institution is None or d["institution"] == institution) and (owner is None or d["owner"] == owner)
+                and (member is None or member in d["data"].get("members", []))]
         rows.sort(key=lambda d: d["updated_at"], reverse=True)
         return [_copy(d["data"]) for d in rows[:limit]]
 
@@ -290,7 +295,8 @@ class Neo4jStore:
                   "CREATE CONSTRAINT method_key IF NOT EXISTS FOR (m:Method) REQUIRE m.key IS UNIQUE",
                   "CREATE CONSTRAINT doc_key IF NOT EXISTS FOR (d:Doc) REQUIRE d.key IS UNIQUE",
                   "CREATE INDEX doc_kind_institution IF NOT EXISTS FOR (d:Doc) ON (d.kind, d.institution)",
-                  "CREATE INDEX doc_kind_owner IF NOT EXISTS FOR (d:Doc) ON (d.kind, d.owner)"):
+                  "CREATE INDEX doc_kind_owner IF NOT EXISTS FOR (d:Doc) ON (d.kind, d.owner)",
+                  "CREATE INDEX doc_kind IF NOT EXISTS FOR (d:Doc) ON (d.kind)"):
             self.driver.execute_query(q, database_="neo4j")
         self._ready = True
 
@@ -457,12 +463,12 @@ class Neo4jStore:
     # ---------------------------------------------------------------- documents
     def put_doc(self, kind: str, doc: dict) -> dict:
         key = _doc_key(kind, doc["id"])
-        linked = kind not in ("notification", "pubcache")      # the graph only needs the research documents
+        linked = kind not in _UNLINKED
         items = lambda field: [{"key": x["key"], "name": x.get("name", x["key"])} for x in doc.get(field) or []  # noqa: E731
                                if isinstance(x, dict) and x.get("key")]
         self._run(
             "MERGE (d:Doc {key: $key}) SET d.kind = $kind, d.id = $id, d.institution = $inst, d.owner = $owner, "
-            "d.data = $data, d.updated_at = $now "
+            "d.members = $members, d.data = $data, d.updated_at = $now "
             "WITH d CALL (d) { OPTIONAL MATCH (d)-[r:AT|ABOUT]->() DELETE r } "
             "CALL (d) { MATCH (i:Institution {key: $inst}) WHERE $linked MERGE (d)-[:AT]->(i) } "
             "CALL (d) { MATCH (p:Person {uid: $owner}) WHERE $linked MERGE (p)-[:POSTED]->(d) } "
@@ -470,7 +476,7 @@ class Neo4jStore:
             "CALL (d) { UNWIND $methods AS x MERGE (m:Method {key: x.key}) ON CREATE SET m.name = x.name MERGE (d)-[:ABOUT]->(m) } "
             "RETURN d.key AS key",
             key=key, kind=kind, id=doc["id"], inst=doc.get("institution", ""), owner=doc.get("owner", ""),
-            data=json.dumps(doc), now=now_iso(), linked=linked,
+            members=list(doc.get("members") or []), data=json.dumps(doc), now=now_iso(), linked=linked,
             topics=items("topics") if linked else [], methods=items("methods") if linked else [])
         return _copy(doc)
 
@@ -478,11 +484,13 @@ class Neo4jStore:
         rows = self._run("MATCH (d:Doc {key: $key}) RETURN d.data AS data", key=_doc_key(kind, doc_id))
         return json.loads(rows[0]["data"]) if rows else None
 
-    def list_docs(self, kind: str, institution: str | None = None, owner: str | None = None, limit: int = 500) -> list[dict]:
+    def list_docs(self, kind: str, institution: str | None = None, owner: str | None = None, limit: int = 500,
+                  member: str | None = None) -> list[dict]:
         _doc_key(kind, "x")
         rows = self._run("MATCH (d:Doc {kind: $kind}) WHERE ($inst IS NULL OR d.institution = $inst) "
-                         "AND ($owner IS NULL OR d.owner = $owner) RETURN d.data AS data ORDER BY d.updated_at DESC LIMIT $limit",
-                         kind=kind, inst=institution, owner=owner, limit=limit)
+                         "AND ($owner IS NULL OR d.owner = $owner) AND ($member IS NULL OR $member IN d.members) "
+                         "RETURN d.data AS data ORDER BY d.updated_at DESC LIMIT $limit",
+                         kind=kind, inst=institution, owner=owner, member=member, limit=limit)
         return [json.loads(r["data"]) for r in rows]
 
     def delete_doc(self, kind: str, doc_id: str) -> None:

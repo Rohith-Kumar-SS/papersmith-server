@@ -19,6 +19,7 @@ from . import team
 from .community import api as community_api
 from .community import college as community_college
 from .community import interests as community_interests
+from .community import messages as community_messages
 from .community import openings as community_openings
 from .community import questions as community_questions
 from .community import related as community_related
@@ -82,6 +83,7 @@ app.include_router(community_openings.router)
 app.include_router(community_questions.router)
 app.include_router(community_college.router)
 app.include_router(community_related.router)
+app.include_router(community_messages.router)
 app.include_router(team.router)
 
 try:
